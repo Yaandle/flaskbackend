@@ -144,13 +144,10 @@ def process_image():
 def serve_static(path):
     return send_from_directory(app.static_folder, path or 'index.html')
 
-
-
 @app.route('/ODIS', methods=['POST'])
 def ODIS():
     logger.info("Received ODIS request")
 
-    # Check if 'files' part is in the request
     if 'files' not in request.files:
         raise BadRequest("No file part in the request")
 
@@ -172,7 +169,7 @@ def ODIS():
     os.makedirs(temp_dir)
 
     try:
-        model = models.get(model_name, None)
+        model = models.get(model_name)
         if not model:
             raise BadRequest(f"Model not loaded or invalid model name: {model_name}")
 
@@ -188,21 +185,21 @@ def ODIS():
             for result in results:
                 detected_classes = result.names
                 for i, detected_class in enumerate(detected_classes):
+                    detected_class = str(detected_class)  # Ensure the detected class is a string
                     output_dir = os.path.join(temp_dir, detected_class)
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    
-                    # Handle detection task only
+
                     annotated_image = result.plot(masks=False, labels=True, boxes=True)
-                    
                     annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
                     _, buffer = cv2.imencode('.jpg', annotated_image_rgb)
 
-                    output_path = os.path.join(output_dir, f"{file.filename.split('.')[0]}_{i}.jpg")
+                    output_filename = f"{str(file.filename.split('.')[0])}_{str(i)}.jpg"
+                    output_path = os.path.join(output_dir, output_filename)
+
                     with open(output_path, 'wb') as f_out:
                         f_out.write(buffer)
 
-        # Create ZIP file of results
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for root, dirs, files in os.walk(temp_dir):
@@ -218,6 +215,3 @@ def ODIS():
     except Exception as e:
         logger.error(f"Error in ODIS: {str(e)}", exc_info=True)
         return jsonify({"error": f"Error in ODIS: {str(e)}"}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
