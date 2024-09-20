@@ -1,2 +1,35 @@
-__pycache__
-*.pyc
+# Version control and IDEs
+.git/
+.vscode/
+.idea/
+
+# Python cache and environment
+__pycache__/
+*.py[cod]
+env/
+venv/
+*.log
+*.cache
+
+# OS generated files
+.DS_Store
+ehthumbs.db
+Thumbs.db
+
+# Application specific
+Datasets/
+filtered_images/
+*.zip
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Documentation
+README.md
+LICENSE
+
+# Keep specific model files
+!UltralyticsModels/*.pt
+
+node_modules
