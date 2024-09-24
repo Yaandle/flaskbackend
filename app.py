@@ -7,8 +7,51 @@ import os, logging, base64, cv2, numpy as np, shutil, zipfile, tempfile
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 import pyrealsense2 as rs
+import jwt
+from jwt.exceptions import InvalidTokenError
+from functools import wraps
+import requests
+
 
 app = Flask(__name__)
+
+CLERK_JWT_VERIFICATION_KEY = os.environ.get('CLERK_JWT_VERIFICATION_KEY')
+CLERK_DOMAIN = os.environ.get('CLERK_DOMAIN')
+CLERK_JWT_AUDIENCE = os.environ.get('CLERK_JWT_AUDIENCE')
+def get_jwt_key(token):
+    jwks_url = f"https://{CLERK_DOMAIN}/.well-known/jwks.json"
+    jwks = requests.get(jwks_url).json()
+    try:
+        kid = jwt.get_unverified_header(token)['kid']
+        for key in jwks['keys']:
+            if key['kid'] == kid:
+                return jwt.algorithms.RSAAlgorithm.from_jwk(key)
+    except Exception:
+        return None
+    
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        try:
+            token = token.split()[1]  # Remove 'Bearer ' prefix
+            key = get_jwt_key(token)
+            if not key:
+                raise InvalidTokenError('Invalid key')
+            jwt.decode(
+                token,
+                key=key,
+                algorithms=["RS256"],
+                audience=CLERK_JWT_AUDIENCE,
+                issuer=f"https://{CLERK_DOMAIN}",
+            )
+        except InvalidTokenError as e:
+            return jsonify({'message': f'Token is invalid: {str(e)}'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '').split(',')
 if ALLOWED_ORIGINS:
     CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
@@ -117,6 +160,8 @@ camera_processor = CameraProcessor()
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    if isinstance(e, InvalidTokenError):
+        return jsonify({"error": "Invalid authentication token", "details": str(e)}), 401
     logger.exception("Unhandled exception occurred")
     return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
@@ -132,6 +177,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg', 'gif'}
 
 @app.route('/process_image', methods=['POST'])
+@token_required
 def process_image():
     logger.info("Starting image processing")
     try:
@@ -172,6 +218,7 @@ def process_image():
         return jsonify({"error": "Image processing failed", "details": str(e)}), 500
 
 @app.route('/ODIS', methods=['POST'])
+@token_required
 def ODIS():
     logger.info("Received ODIS request")
     if 'files' not in request.files:
@@ -241,6 +288,7 @@ def ODIS():
         shutil.rmtree(temp_dir)
 
 @app.route('/process_camera', methods=['GET'])
+@token_required
 def process_camera():
     try:
         camera_processor.start()
