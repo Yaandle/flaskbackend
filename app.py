@@ -11,13 +11,19 @@ import jwt
 from jwt.exceptions import InvalidTokenError
 from functools import wraps
 import requests
-
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
+
+# Security configurations
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB limit
+app.config['MAX_FIELDS'] = 100  # Limit number of form fields
 
 CLERK_JWT_VERIFICATION_KEY = os.environ.get('CLERK_JWT_VERIFICATION_KEY')
 CLERK_DOMAIN = os.environ.get('CLERK_DOMAIN')
 CLERK_JWT_AUDIENCE = os.environ.get('CLERK_JWT_AUDIENCE')
+
 def get_jwt_key(token):
     jwks_url = f"https://{CLERK_DOMAIN}/.well-known/jwks.json"
     jwks = requests.get(jwks_url).json()
@@ -52,15 +58,40 @@ def token_required(f):
         return f(*args, **kwargs)
     return decorated
 
+# CORS configuration
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '').split(',')
 if ALLOWED_ORIGINS:
-    CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+    CORS(app, resources={r"/*": {
+        "origins": ALLOWED_ORIGINS,
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "supports_credentials": True,
+        "allow_private_network": False
+    }})
 else:
-    CORS(app)
+    CORS(app, resources={r"/*": {
+        "origins": "*",
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "supports_credentials": True,
+        "allow_private_network": False
+    }})
 
+# Security headers
 Talisman(app, content_security_policy=None)
+
+# Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Rate limiting
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
 MODELS_DIR = os.environ.get('MODELS_DIR', 'UltralyticsModels')
 model_paths = {
@@ -105,6 +136,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg', 'gif'}
 
 @app.route('/process_image', methods=['POST'])
+@limiter.limit("10 per minute")
 @token_required
 def process_image():
     logger.info("Starting image processing")
@@ -146,6 +178,7 @@ def process_image():
         return jsonify({"error": "Image processing failed", "details": str(e)}), 500
 
 @app.route('/ODIS', methods=['POST'])
+@limiter.limit("5 per minute")
 @token_required
 def ODIS():
     logger.info("Received ODIS request")
@@ -228,5 +261,10 @@ def ODIS():
 def serve_static(path):
     return send_from_directory(app.static_folder, path or 'index.html')
 
+@app.after_request
+def add_vary_header(response):
+    response.headers["Vary"] = "Cookie"
+    return response
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
