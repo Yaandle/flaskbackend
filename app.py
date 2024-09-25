@@ -36,7 +36,7 @@ def token_required(f):
         if not token:
             return jsonify({'message': 'Token is missing!'}), 401
         try:
-            token = token.split()[1]  # Remove 'Bearer ' prefix
+            token = token.split()[1]  
             key = get_jwt_key(token)
             if not key:
                 raise InvalidTokenError('Invalid key')
@@ -70,8 +70,6 @@ model_paths = {
     'YOLOV10': f'{MODELS_DIR}/yolov10m.pt',
     'YOLOV8': f'{MODELS_DIR}/yolov8x.pt',
     'YOLOV5': f'{MODELS_DIR}/yolov5mu.pt',
-    'RNF4': f'{MODELS_DIR}/RiderNF4.pt',
-    'RNF6': f'{MODELS_DIR}/RNF6.pt',
     'RNF7': f'{MODELS_DIR}/RNF7.pt',
 }
 
@@ -87,76 +85,6 @@ def initialize_models():
 
 models = initialize_models()
 executor = ThreadPoolExecutor(max_workers=4)
-
-class CameraProcessor:
-    def __init__(self):
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        self.model = models.get('YOLOV8')  # Use YOLOV8 as default, adjust as needed
-
-    def start(self):
-        self.pipeline.start(self.config)
-
-    def stop(self):
-        self.pipeline.stop()
-
-    def get_frames(self):
-        frames = self.pipeline.wait_for_frames()
-        depth_frame = frames.get_depth_frame()
-        color_frame = frames.get_color_frame()
-        if not depth_frame or not color_frame:
-            return None, None, None
-
-        depth_image = np.asanyarray(depth_frame.get_data())
-        color_image = np.asanyarray(color_frame.get_data())
-        return color_image, depth_frame, depth_image
-
-    def process_detections(self, results, depth_frame):
-        output = []
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = box.conf.cpu().numpy()[0]
-                cls = int(box.cls.cpu().numpy()[0])
-                class_name = r.names[cls]
-                
-                center_x, center_y = int((x1 + x2) / 2), int((y1 + y2) / 2)
-                depth = depth_frame.get_distance(center_x, center_y)
-                
-                detection_data = {
-                    "class": class_name,
-                    "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                    "confidence": float(conf),
-                    "center_point": (center_x, center_y),
-                    "depth": float(depth)
-                }
-                output.append(detection_data)
-        return output
-
-    def display_frame(self, color_image, detections):
-        for detection in detections:
-            x1, y1, x2, y2 = detection['bbox']
-            cv2.rectangle(color_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"{detection['class']} {detection['confidence']:.2f} {detection['depth']:.2f}m"
-            cv2.putText(color_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        return color_image
-
-    def process_frame(self):
-        color_image, depth_frame, depth_image = self.get_frames()
-        if color_image is None or depth_frame is None:
-            return None, None, None
-
-        depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
-        results = self.model(color_image)
-        detections = self.process_detections(results, depth_frame)
-        annotated_image = self.display_frame(color_image, detections)
-        
-        return annotated_image, depth_colormap, detections
-
-camera_processor = CameraProcessor()
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -236,6 +164,9 @@ def ODIS():
         
         total_detections = 0
         saved_images = 0
+        no_detection_dir = os.path.join(temp_dir, "No_Detections")
+        os.makedirs(no_detection_dir, exist_ok=True)
+
         for file in files:
             image_bytes = file.read()
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -245,14 +176,19 @@ def ODIS():
                 continue
             
             results = model(opencv_image, conf=0.4)
+            classes_detected = set(result.names[int(box.cls)] for result in results for box in result.boxes)
+            total_detections += len(classes_detected)
+            
+            if not classes_detected:
+                logger.warning(f"No objects detected in {file.filename}")
+                output_path = os.path.join(no_detection_dir, file.filename)
+                if cv2.imwrite(output_path, opencv_image):
+                    saved_images += 1
+                else:
+                    logger.error(f"Failed to save image with no detections: {output_path}")
+                continue
+            
             for result in results:
-                classes_detected = set(result.names[int(box.cls)] for box in result.boxes)
-                total_detections += len(classes_detected)
-                
-                if not classes_detected:
-                    logger.warning(f"No objects detected in {file.filename}")
-                    continue
-                
                 annotated_image = result.plot(masks=False, labels=True, boxes=True)
                 annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
                 
@@ -286,30 +222,6 @@ def ODIS():
         return jsonify({"error": f"Error in ODIS: {str(e)}"}), 500
     finally:
         shutil.rmtree(temp_dir)
-
-@app.route('/process_camera', methods=['GET'])
-@token_required
-def process_camera():
-    try:
-        camera_processor.start()
-        annotated_image, depth_colormap, detections = camera_processor.process_frame()
-        camera_processor.stop()
-
-        if annotated_image is None:
-            raise ValueError("Failed to capture frame")
-        _, rgb_buffer = cv2.imencode('.jpg', annotated_image)
-        _, depth_buffer = cv2.imencode('.jpg', depth_colormap)
-        rgb_base64 = base64.b64encode(rgb_buffer).decode('utf-8')
-        depth_base64 = base64.b64encode(depth_buffer).decode('utf-8')
-
-        return jsonify({
-            "rgb_image": f"data:image/jpeg;base64,{rgb_base64}",
-            "depth_image": f"data:image/jpeg;base64,{depth_base64}",
-            "detections": detections
-        })
-    except Exception as e:
-        logger.error(f"Error in camera processing: {str(e)}", exc_info=True)
-        return jsonify({"error": "Camera processing failed", "details": str(e)}), 500
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
