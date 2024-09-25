@@ -1,11 +1,11 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, session
 from flask_cors import CORS
 from flask_talisman import Talisman
-from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from ultralytics import YOLO
-import os, logging, base64, cv2, numpy as np, shutil, zipfile, tempfile
+import os, logging, base64, cv2, numpy as np, shutil, zipfile, tempfile, uuid
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pyrealsense2 as rs
 import jwt
 from jwt.exceptions import InvalidTokenError
@@ -16,13 +16,29 @@ from flask_limiter.util import get_remote_address
 
 app = Flask(__name__)
 
-# Security configurations
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB limit
-app.config['MAX_FIELDS'] = 100  # Limit number of form fields
-
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  
+app.config['MAX_FIELDS'] = 100
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key') 
 CLERK_JWT_VERIFICATION_KEY = os.environ.get('CLERK_JWT_VERIFICATION_KEY')
 CLERK_DOMAIN = os.environ.get('CLERK_DOMAIN')
 CLERK_JWT_AUDIENCE = os.environ.get('CLERK_JWT_AUDIENCE')
+CORS(app, resources={r"/*": {
+    "origins": os.environ.get('ALLOWED_ORIGINS', 'https://yksolutions-173092804788.asia-northeast3.run.app').split(','),
+    "methods": ["GET", "POST", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"]
+}})
+Talisman(app, content_security_policy={
+    'default-src': "'self'",
+    'img-src': "'self' data:",
+    'script-src': "'self' 'unsafe-inline'"
+})
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
 def get_jwt_key(token):
     jwks_url = f"https://{CLERK_DOMAIN}/.well-known/jwks.json"
@@ -34,7 +50,7 @@ def get_jwt_key(token):
                 return jwt.algorithms.RSAAlgorithm.from_jwk(key)
     except Exception:
         return None
-    
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -57,19 +73,6 @@ def token_required(f):
             return jsonify({'message': f'Token is invalid: {str(e)}'}), 401
         return f(*args, **kwargs)
     return decorated
-
-Talisman(app, content_security_policy=None)
-
-# Logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Rate limiting
-limiter = Limiter(
-    app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"]
-)
 
 MODELS_DIR = os.environ.get('MODELS_DIR', 'UltralyticsModels')
 model_paths = {
@@ -99,6 +102,8 @@ executor = ThreadPoolExecutor(max_workers=4)
 def handle_exception(e):
     if isinstance(e, InvalidTokenError):
         return jsonify({"error": "Invalid authentication token", "details": str(e)}), 401
+    if isinstance(e, RequestEntityTooLarge):
+        return jsonify({"error": "File too large", "details": "The uploaded file exceeds the maximum allowed size."}), 413
     logger.exception("Unhandled exception occurred")
     return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
@@ -155,8 +160,46 @@ def process_image():
         logger.error(f"Error in image processing: {str(e)}", exc_info=True)
         return jsonify({"error": "Image processing failed", "details": str(e)}), 500
 
+def process_image_odis(file, model, temp_dir, job_id):
+    image_bytes = file.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    opencv_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if opencv_image is None:
+        logger.warning(f"Failed to decode image: {file.filename}")
+        return None
+    
+    results = model(opencv_image, conf=0.4)
+    classes_detected = set(result.names[int(box.cls)] for result in results for box in result.boxes)
+    
+    if not classes_detected:
+        logger.warning(f"No objects detected in {file.filename}")
+        output_path = os.path.join(temp_dir, "No_Detections", file.filename)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if cv2.imwrite(output_path, opencv_image):
+            return "No_Detections"
+        else:
+            logger.error(f"Failed to save image with no detections: {output_path}")
+            return None
+    
+    for result in results:
+        annotated_image = result.plot(masks=False, labels=True, boxes=True)
+        annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+        
+        for class_name in classes_detected:
+            class_output_dir = os.path.join(temp_dir, class_name)
+            os.makedirs(class_output_dir, exist_ok=True)
+            output_filename = f"{os.path.splitext(file.filename)[0]}_{class_name}.jpg"
+            output_path = os.path.join(class_output_dir, output_filename)
+            if cv2.imwrite(output_path, annotated_image_rgb):
+                return class_name
+            else:
+                logger.error(f"Failed to save image: {output_path}")
+                return None
+    
+    return None
+
 @app.route('/ODIS', methods=['POST'])
-@limiter.limit("5 per minute")
+@limiter.limit("20 per hour")
 @token_required
 def ODIS():
     logger.info("Received ODIS request")
@@ -168,53 +211,23 @@ def ODIS():
         return jsonify({"error": "No selected files"}), 400
     
     temp_dir = tempfile.mkdtemp()
+    job_id = str(uuid.uuid4())
+    session[f'odis_progress_{job_id}'] = 0
+    
     try:
         model = models.get(model_name)
         if not model:
             return jsonify({"error": f"Invalid model: {model_name}"}), 400
         
-        total_detections = 0
-        saved_images = 0
-        no_detection_dir = os.path.join(temp_dir, "No_Detections")
-        os.makedirs(no_detection_dir, exist_ok=True)
-
-        for file in files:
-            image_bytes = file.read()
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            opencv_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if opencv_image is None:
-                logger.warning(f"Failed to decode image: {file.filename}")
-                continue
-            
-            results = model(opencv_image, conf=0.4)
-            classes_detected = set(result.names[int(box.cls)] for result in results for box in result.boxes)
-            total_detections += len(classes_detected)
-            
-            if not classes_detected:
-                logger.warning(f"No objects detected in {file.filename}")
-                output_path = os.path.join(no_detection_dir, file.filename)
-                if cv2.imwrite(output_path, opencv_image):
-                    saved_images += 1
-                else:
-                    logger.error(f"Failed to save image with no detections: {output_path}")
-                continue
-            
-            for result in results:
-                annotated_image = result.plot(masks=False, labels=True, boxes=True)
-                annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+        total_files = len(files)
+        processed_files = 0
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_file = {executor.submit(process_image_odis, file, model, temp_dir, job_id): file for file in files}
+            for future in as_completed(future_to_file):
+                processed_files += 1
+                session[f'odis_progress_{job_id}'] = (processed_files / total_files) * 100
                 
-                for class_name in classes_detected:
-                    class_output_dir = os.path.join(temp_dir, class_name)
-                    os.makedirs(class_output_dir, exist_ok=True)
-                    output_filename = f"{os.path.splitext(file.filename)[0]}_{class_name}.jpg"
-                    output_path = os.path.join(class_output_dir, output_filename)
-                    if cv2.imwrite(output_path, annotated_image_rgb):
-                        saved_images += 1
-                    else:
-                        logger.error(f"Failed to save image: {output_path}")
-        
-        logger.info(f"Total detections: {total_detections}, Total saved images: {saved_images}")
-        
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for root, _, files in os.walk(temp_dir):
@@ -233,6 +246,14 @@ def ODIS():
         return jsonify({"error": f"Error in ODIS: {str(e)}"}), 500
     finally:
         shutil.rmtree(temp_dir)
+        session.pop(f'odis_progress_{job_id}', None)
+
+@app.route('/ODIS/progress', methods=['GET'])
+@token_required
+def get_odis_progress():
+    job_id = request.args.get('job_id')
+    progress = session.get(f'odis_progress_{job_id}', 0)
+    return jsonify({"progress": progress})
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
