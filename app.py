@@ -58,28 +58,6 @@ def token_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# CORS configuration
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '').split(',')
-if ALLOWED_ORIGINS:
-    CORS(app, resources={r"/*": {
-        "origins": ALLOWED_ORIGINS,
-        "allow_headers": ["Content-Type", "Authorization"],
-        "expose_headers": ["Content-Type", "Authorization"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "supports_credentials": True,
-        "allow_private_network": False
-    }})
-else:
-    CORS(app, resources={r"/*": {
-        "origins": "*",
-        "allow_headers": ["Content-Type", "Authorization"],
-        "expose_headers": ["Content-Type", "Authorization"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "supports_credentials": True,
-        "allow_private_network": False
-    }})
-
-# Security headers
 Talisman(app, content_security_policy=None)
 
 # Logging configuration
@@ -265,6 +243,10 @@ def serve_static(path):
 def add_vary_header(response):
     response.headers["Vary"] = "Cookie"
     return response
+
+def make_verified_request(*args, **kwargs):
+    kwargs['verify'] = True
+    return requests.request(*args, **kwargs)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
