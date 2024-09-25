@@ -6,7 +6,6 @@ from ultralytics import YOLO
 import os, logging, base64, cv2, numpy as np, shutil, zipfile, tempfile, uuid
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pyrealsense2 as rs
 import jwt
 from jwt.exceptions import InvalidTokenError
 from functools import wraps
@@ -17,13 +16,12 @@ from flask_limiter.util import get_remote_address
 app = Flask(__name__)
 
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  
-app.config['MAX_FIELDS'] = 100
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key') 
+app.config['SECRET_KEY'] = os.environ['SECRET_KEY']
 CLERK_JWT_VERIFICATION_KEY = os.environ.get('CLERK_JWT_VERIFICATION_KEY')
 CLERK_DOMAIN = os.environ.get('CLERK_DOMAIN')
 CLERK_JWT_AUDIENCE = os.environ.get('CLERK_JWT_AUDIENCE')
 CORS(app, resources={r"/*": {
-    "origins": os.environ.get('ALLOWED_ORIGINS', 'https://yksolutions-173092804788.asia-northeast3.run.app').split(','),
+    "origins": os.environ.get('ALLOWED_ORIGINS', '').split(','),
     "methods": ["GET", "POST", "OPTIONS"],
     "allow_headers": ["Content-Type", "Authorization"]
 }})
@@ -34,11 +32,7 @@ Talisman(app, content_security_policy={
 })
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-limiter = Limiter(
-    app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"]
-)
+limiter = Limiter(app, key_func=get_remote_address, default_limits=["200 per day", "50 per hour"])
 
 def get_jwt_key(token):
     jwks_url = f"https://{CLERK_DOMAIN}/.well-known/jwks.json"
@@ -58,7 +52,7 @@ def token_required(f):
         if not token:
             return jsonify({'message': 'Token is missing!'}), 401
         try:
-            token = token.split()[1]  
+            token = token.split()[1]
             key = get_jwt_key(token)
             if not key:
                 raise InvalidTokenError('Invalid key')
@@ -200,74 +194,65 @@ def process_image_odis(file, model, temp_dir, job_id):
 
 @app.route('/ODIS', methods=['POST'])
 @limiter.limit("20 per hour")
-@token_required
+@token_required  
 def ODIS():
     logger.info("Received ODIS request")
     if 'files' not in request.files:
         return jsonify({"error": "No files in the request"}), 400
+    
     files = request.files.getlist('files')
     model_name = request.form.get('model')
     if not files:
         return jsonify({"error": "No selected files"}), 400
+    if not model_name or model_name not in models:
+        return jsonify({"error": f"Invalid model: {model_name}"}), 400
     
+    model = models[model_name]
     temp_dir = tempfile.mkdtemp()
     job_id = str(uuid.uuid4())
-    session[f'odis_progress_{job_id}'] = 0
-    
+    successful_classes = []
+    failed_files = []
     try:
-        model = models.get(model_name)
-        if not model:
-            return jsonify({"error": f"Invalid model: {model_name}"}), 400
+        futures = {executor.submit(process_image_odis, file, model, temp_dir, job_id): file for file in files}
+        for future in as_completed(futures):
+            file = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    successful_classes.append(result)
+                else:
+                    failed_files.append(file.filename)
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}", exc_info=True)
+                failed_files.append(file.filename)
         
-        total_files = len(files)
-        processed_files = 0
-        
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_file = {executor.submit(process_image_odis, file, model, temp_dir, job_id): file for file in files}
-            for future in as_completed(future_to_file):
-                processed_files += 1
-                session[f'odis_progress_{job_id}'] = (processed_files / total_files) * 100
-                
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for root, _, files in os.walk(temp_dir):
+        output_zip = os.path.join(temp_dir, f"ODIS_results_{job_id}.zip")
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(temp_dir):
                 for file in files:
-                    file_path = os.path.join(root, file)
-                    archive_path = os.path.relpath(file_path, temp_dir)
-                    zip_file.write(file_path, archive_path)
+                    zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), temp_dir))
         
-        zip_buffer.seek(0)
-        if zip_buffer.getbuffer().nbytes > 0:
-            return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='filtered_images.zip')
-        else:
-            return jsonify({"error": "No objects detected in any of the images"}), 400
+        response_data = {
+            "successful_classes": successful_classes,
+            "failed_files": failed_files,
+            "download_link": f"/download/{os.path.basename(output_zip)}"
+        }
+        return jsonify(response_data)
+    
     except Exception as e:
-        logger.error(f"Error in ODIS: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Error in ODIS: {str(e)}"}), 500
+        logger.error(f"Error processing ODIS batch: {str(e)}", exc_info=True)
+        return jsonify({"error": "ODIS processing failed", "details": str(e)}), 500
     finally:
         shutil.rmtree(temp_dir)
-        session.pop(f'odis_progress_{job_id}', None)
 
-@app.route('/ODIS/progress', methods=['GET'])
+@app.route('/download/<filename>', methods=['GET'])
 @token_required
-def get_odis_progress():
-    job_id = request.args.get('job_id')
-    progress = session.get(f'odis_progress_{job_id}', 0)
-    return jsonify({"progress": progress})
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory(app.static_folder, path or 'index.html')
-
-@app.after_request
-def add_vary_header(response):
-    response.headers["Vary"] = "Cookie"
-    return response
-
-def make_verified_request(*args, **kwargs):
-    kwargs['verify'] = True
-    return requests.request(*args, **kwargs)
+def download_file(filename):
+    try:
+        return send_from_directory(tempfile.gettempdir(), filename, as_attachment=True)
+    except Exception as e:
+        logger.error(f"Error downloading file {filename}: {str(e)}", exc_info=True)
+        return jsonify({"error": "File download failed", "details": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
+    app.run(host='0.0.0.0', port=5000)

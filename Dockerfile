@@ -1,63 +1,62 @@
-# Build stage
-FROM node:18.17-alpine AS build
+# Use an official Python runtime as a parent image
+FROM python:3.9-slim-buster as builder
 
-# Set working directory
+# Set environment variables to ensure Python output is sent straight to terminal without buffering
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=on
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgtk2.0-dev \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory in the container
 WORKDIR /app
 
-# Copy package.json and package-lock.json
-COPY package*.json ./
+# Copy only the requirements file initially
+COPY requirements.txt .
 
-# Install dependencies
-RUN npm ci
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Start a new stage for the final image
+FROM python:3.9-slim-buster
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8080
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the installed packages from the builder stage
+COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy necessary libraries from builder stage
+COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+COPY --from=builder /lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+
+# Copy the application code
 COPY . .
 
-# Set up build-time arguments for environment variables
-ARG NEXT_PUBLIC_FLASK_SERVER_URL
-ENV NEXT_PUBLIC_FLASK_SERVER_URL=$NEXT_PUBLIC_FLASK_SERVER_URL
+# Create a non-root user and switch to it
+RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
 
-ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-
-# Build the Next.js application with verbose output
-RUN npm run build
-
-# Production stage
-FROM node:18.17-alpine AS production
-
-# Set working directory
-WORKDIR /app
-
-# Create a non-root user
-RUN addgroup -g 1001 -S nodejs
-RUN adduser -S nextjs -u 1001
-
-# Copy package.json and package-lock.json
-COPY package*.json ./
-
-# Install only production dependencies
-RUN npm ci --only=production
-
-# Copy built application from build stage
-COPY --from=build /app/.next ./.next
-COPY --from=build /app/public ./public
-COPY --from=build /app/next.config.mjs ./next.config.mjs
-
-# Set runtime environment variables
-ENV NODE_ENV production
-ENV NEXT_TELEMETRY_DISABLED 1
-ENV NEXT_PUBLIC_FLASK_SERVER_URL=$NEXT_PUBLIC_FLASK_SERVER_URL
-ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-
-# Change ownership of the app directory to the non-root user
-RUN chown -R nextjs:nodejs /app
-
-# Switch to non-root user
-USER nextjs
-
-# Expose the listening port
+# Make port 8080 available to the world outside this container
 EXPOSE 8080
 
-# Run the application
-CMD ["npm", "run", "start"]
+# Use Gunicorn to serve the application
+CMD ["gunicorn", "--bind", ":$PORT", "--workers", "2", "--threads", "4", "--timeout", "30", "app:app"]
