@@ -1,3 +1,3 @@
 Flask backend for /ODIS /MFIT
 
-Will add SLAM and RTAB-Map Integration, and Intel Camera Intergration
+Updated to work locally, need to update again to deploy to production

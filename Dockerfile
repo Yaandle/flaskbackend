@@ -1,13 +1,13 @@
-# Use an official Python runtime as a parent image
+# Base image for building
 FROM python:3.9-slim-buster as builder
 
-# Set environment variables to ensure Python output is sent straight to terminal without buffering
+# Set environment variables to optimize Python behavior
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
     PIP_DISABLE_PIP_VERSION_CHECK=on
 
-# Install system dependencies
+# Install necessary system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libc6-dev \
@@ -17,46 +17,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         libxrender-dev \
         libgtk2.0-dev \
-        ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+        ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Copy only the requirements file initially
-COPY requirements.txt .
-
-# Install Python dependencies
+# Copy requirements and install dependencies
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Start a new stage for the final image
+# Base image for production
 FROM python:3.9-slim-buster
 
-# Set environment variables
+# Set environment variables for optimized Python runtime
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8080
+    PYTHONDONTWRITEBYTECODE=1
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Copy the installed packages from the builder stage
+# Copy the built Python packages and dependencies from builder stage
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copy necessary libraries from builder stage
 COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
 COPY --from=builder /lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
 
-# Copy the application code
+# Copy the rest of the application code
 COPY . .
 
-# Create a non-root user and switch to it
+# Create a non-root user for security
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Make port 8080 available to the world outside this container
+# Set the default port for Flask 
 EXPOSE 8080
 
-# Use Gunicorn to serve the application
-CMD ["gunicorn", "--bind", ":$PORT", "--workers", "2", "--threads", "4", "--timeout", "30", "app:app"]
+# Start the application using Gunicorn
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 0 app:app
